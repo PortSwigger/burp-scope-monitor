@@ -5,6 +5,8 @@ from burp import IHttpListener
 from burp import IMessageEditorController
 from burp import IContextMenuFactory
 from burp import IExtensionStateListener
+from burp import IScannerCheck
+from java.net import URL
 from java.awt import Component;
 from java.io import PrintWriter;
 from java.util import ArrayList;
@@ -47,6 +49,10 @@ from java.lang import Runnable
 from javax.swing import RowFilter
 from java.awt.event import ItemListener
 from javax.swing.table import TableRowSorter
+
+
+from java.awt import EventQueue
+
 from urlparse import *
 import datetime 
 import time
@@ -64,6 +70,13 @@ MONITOR_OFF_LABEL = "Monitor is OFF"
 
 SCOPE_MONITOR_COMMENT = "scope-monitor-placeholder"
 
+class Run(Runnable):
+    def __init__(self, runner):
+        self.runner = runner
+
+    def run(self):
+        self.runner()
+
 class BurpExtender(IBurpExtender, ITab, IHttpListener, IMessageEditorController, AbstractTableModel, IContextMenuFactory, IExtensionStateListener):
     
     #
@@ -78,7 +91,7 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IMessageEditorController,
         self._helpers = callbacks.getHelpers()
         
         # set our extension name
-        callbacks.setExtensionName("Burp Scope Monitor")
+        callbacks.setExtensionName("Burp Scope Monitor Experimental")
 
         self.GLOBAL_HANDLER_ANALYZED = False
         self.GLOBAL_HANDLER = False
@@ -87,7 +100,7 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IMessageEditorController,
         self.AUTOSAVE_TIMEOUT  = 600 # 10 minutes should be fine
         self.CONFIG_INSCOPE    = True
 
-        self.BAD_EXTENSIONS_DEFAULT = ['.gif', '.png', '.js', '.woff', '.woff2', '.jpeg', '.jpg', '.css', '.ico', '.m3u8', '.ts']
+        self.BAD_EXTENSIONS_DEFAULT = ['.gif', '.png', '.js', '.woff', '.woff2', '.jpeg', '.jpg', '.css', '.ico', '.m3u8', '.ts', '.svg']
         self.BAD_MIMES_DEFAULT      = ['gif', 'script', 'jpeg', 'jpg', 'png', 'video', 'mp2t']
         
         self.BAD_EXTENSIONS = self.BAD_EXTENSIONS_DEFAULT
@@ -359,6 +372,7 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IMessageEditorController,
 
         callbacks.registerContextMenuFactory(self)
         callbacks.registerExtensionStateListener(self)
+        # callbacks.registerScannerCheck(passiveScanner(self))
         
         # add the custom tab to Burp's UI
         callbacks.addSuiteTab(self)
@@ -369,6 +383,10 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IMessageEditorController,
         self.loadConfigs()
 
         print "Loaded!"
+
+        print "Experimental import state.. "
+        self.importState("")
+
         self.SC = sched.scheduler(time.time, time.sleep)
         self.SCC = self.SC.enter(10, 1, self.autoSave, (self.SC,))
         self.SC.run()
@@ -378,12 +396,12 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IMessageEditorController,
     ##### CUSTOM CODE #####
     def loadConfigs(self):
 
-        if self._callbacks.loadExtensionSetting("CONFIG_AUTOSTART") == "True":
-            self.startOptionButton.setSelected(True)
-            self.startOrStop(None, True)
-        else:
+        if self._callbacks.loadExtensionSetting("CONFIG_AUTOSTART") == "False":
             self.startOptionButton.setSelected(False)
             self.startOrStop(None, False)
+        else:
+            self.startOptionButton.setSelected(True)
+            self.startOrStop(None, True)
 
         if self._callbacks.loadExtensionSetting("exportFile") != "":
             self.selectPathText.setText(self._callbacks.loadExtensionSetting("exportFile"))
@@ -535,10 +553,10 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IMessageEditorController,
         return
 
     def handleSaveButton(self, event):
-        self.exportState("test")
+        self.exportState("")
 
     def handleLoadButton(self, event):
-        self.importState("test")
+        self.importState("")
 
     def handleRepeaterOptionButton(self, event):
         self._callbacks.saveExtensionSetting("CONFIG_REPEATER", str(self.repeaterOptionButton.isSelected()))
@@ -643,21 +661,28 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IMessageEditorController,
         #print "markAnalyzed..."
         self._lock.acquire()
 
+        method = self.getMethod(messageIsRequest)
         url = self.getEndpoint(messageIsRequest)
+        #这里有bug,应该同时比较method
         for item in self._log:
-            if url == item._url:
+            if url == item._url and method==self._helpers.analyzeRequest(item._requestResponse).getMethod():
                 item._analyzed = state
                 self._lock.release()
                 return
         self._lock.release()
         return
 
+    # 不能把右键和代理混在一起，不然来源于porxy的非右键流量会覆盖item，存在逻辑错误
+    # 完美调试通过了
     def processHttpMessage(self, toolFlag, messageIsRequest, messageInfo):
         # only process requests
 
         #print "processing httpMessage.."
         #print messageIsRequest
-        #print "processHttp status: " + str(self.STATUS)
+
+        # print "processHttpMessage toolFlag: " + str(toolFlag)
+        #print " -- " + str(self._callbacks.getToolName(toolFlag)) + " -- "
+
         if not(self.STATUS):
             return
 
@@ -665,6 +690,7 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IMessageEditorController,
         #print "(processHTTP) messageIsRequest"
         #print messageIsRequest 
         if messageIsRequest and not(self.GLOBAL_HANDLER):
+            # print "1.5 processHttpMessage droping message"
             return
 
         if self.scopeOptionButton.isSelected():
@@ -673,12 +699,119 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IMessageEditorController,
                 #print 'Url not in scope, skipping.. '
                 return
 
-        #print "still processing httpMessage.., request came from: " + self._callbacks.getToolName(toolFlag)
+        url = self.getEndpoint(messageInfo)
+        method = self.getMethod(messageInfo)
 
-        if ((self._callbacks.getToolName(toolFlag) != "Repeater") and (self._callbacks.getToolName(toolFlag) != "Proxy") and (self._callbacks.getToolName(toolFlag) != "Target")):
-            #print 'Aborting processHTTP, request came from: ' + str(self._callbacks.getToolName(toolFlag))
+        #print "(processHTTP) before extensions check: " + url 
+
+        for extension in self.BAD_EXTENSIONS:
+            if url.endswith(extension):
+                return
+
+        if messageInfo.getResponse():
+            mime = self._helpers.analyzeResponse(messageInfo.getResponse()).getStatedMimeType()
+            #print 'Declared mime:' + mime
+            mime = mime.lower()
+            if mime in self.BAD_MIMES:
+                #print 'Bad mime:' + mime
+                return
+
+        #print "[httpMessage] before lock"        
+        # create a new log entry with the message details
+        self._lock.acquire()
+
+        row = self._log.size()
+
+        analyzed=False
+        ined=False
+        
+
+        self.GLOBAL_HANDLER=True
+        self.GLOBAL_HANDLER_ANALYZED=False
+
+        try:
+            for item in self._log:
+                # print "arrive 735"
+                if url == item._url:
+                    # print "arrive 737"
+                    if method == self._helpers.analyzeRequest(item._requestResponse).getMethod():
+                        #print 'duplicate URL+method, skipping.. '
+                        # self._lock.release()
+                        # has it been analyzed?
+                        # 非右键的同路径新请求(也就是被动扫描)会覆盖掉所在的item，比如测过的会被刷新为非测过的，不合逻辑,因此这里是个bug
+                        # 已经存在记录表里的话可以直接break
+                        ined=True
+                        analyzed=item._analyzed
+                        self.GLOBAL_HANDLER_ANALYZED = True if analyzed else False
+                        # print "arrive 745"
+                        self.paintItems(messageInfo, item)
+                        # print('paint item with:'+str(analyzed))
+                        break
+
+
+            # 如果在scope里但是没有在log里则创建新的item项
+            if not ined:
+                # print "arrive 755"
+                # print "into not ined but in scope"
+                messageInfo.setComment(SCOPE_MONITOR_COMMENT)
+                date = datetime.datetime.fromtimestamp(time.time()).strftime('%H:%M:%S %d %b %Y')
+                entry = LogEntry(toolFlag, self._callbacks.saveBuffersToTempFiles(messageInfo), url, analyzed, date, method)
+                #print "toolFlag: " + str(toolFlag)
+                #print "(processHTTP) Adding URL: " + url 
+                # print("add item with:"+str(analyzed))
+                self._log.add(entry)
+                self._fullLog.add(entry)
+                self.fireTableRowsInserted(row, row)
+                # print "arrive 766"
+                self.paintItems(messageInfo, entry)
+            #注意还原全局标志变量
+            self.GLOBAL_HANDLER_ANALYZED = False
+            self.GLOBAL_HANDLER=False
+        except Exception as e:
+            # print "772"
+            print e.message 
+            #异常后也应该释放锁
+            self._lock.release()
+
+        self._lock.release()
+            #print "columnCoun:" + str(self.logTable.getColumnCount())
+
+
+
+    # 处理右键相关的message
+    def processHttpMessageAdvanced(self, toolFlag, messageIsRequest, messageInfo):
+        # only process requests
+
+        #print "processing httpMessage.."
+        #print messageIsRequest
+
+        # print "processHttpMessageAdvanced toolFlag: " + str(toolFlag)
+        #print " -- " + str(self._callbacks.getToolName(toolFlag)) + " -- "
+
+        if not(self.STATUS):
             return
 
+        #print "global handler status: (true): " + str(self.GLOBAL_HANDLER)
+        #print "(processHTTP) messageIsRequest"
+        #print messageIsRequest 
+
+        if messageIsRequest and not(self.GLOBAL_HANDLER):
+            # print "1.5 processHttpMessageAdvanced droping message"
+            return
+
+        if self.scopeOptionButton.isSelected():
+            url = self._helpers.analyzeRequest(messageInfo).getUrl()
+            if not self._callbacks.isInScope(url):
+                #print 'Url not in scope, skipping.. '
+                return
+
+        #toolFlag = 4
+        if ((self._callbacks.getToolName(toolFlag) != "Repeater") and (self._callbacks.getToolName(toolFlag) != "Proxy") and (self._callbacks.getToolName(toolFlag) != "Target")):
+            #print 'Aborting processHTTP, request came from: ' + str(self._callbacks.getToolName(toolFlag))
+            print "Droping request from " + str(self._callbacks.getToolName(toolFlag))
+            return
+
+        #print "---> still processing from tool: " + str(self._callbacks.getToolName(toolFlag))
 
         url = self.getEndpoint(messageInfo)
         method = self.getMethod(messageInfo)
@@ -702,52 +835,54 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IMessageEditorController,
         self._lock.acquire()
         row = self._log.size()
 
+        try:
+            for item in self._log:
+                if url == item._url:
+                    if method == self._helpers.analyzeRequest(item._requestResponse).getMethod():
+                        #print 'duplicate URL+method, skipping.. '
+                        self._lock.release()
 
-        for item in self._log:
-            if url == item._url:
-                if method == self._helpers.analyzeRequest(item._requestResponse).getMethod():
-                    #print 'duplicate URL+method, skipping.. '
-                    self._lock.release()
-
-                    # has it been analyzed?
-                    analyzed = False
-                    if self._callbacks.getToolName(toolFlag) == "Repeater":
-                        if self.repeaterOptionButton.isSelected():
+                        # has it been analyzed?
+                        analyzed = False
+                        if self._callbacks.getToolName(toolFlag) == "Repeater":
+                            if self.repeaterOptionButton.isSelected():
+                                analyzed = True
+                                #print "[httpMessage] setting analyzed as true" 
+                        if self.GLOBAL_HANDLER_ANALYZED:
                             analyzed = True
-                            #print "[httpMessage] setting analyzed as true" 
-                    if self.GLOBAL_HANDLER_ANALYZED:
-                        analyzed = True
 
-                    item._analyzed = analyzed
-                    self.paintItems(messageInfo, item)
+                        item._analyzed = analyzed
+                        self.paintItems(messageInfo, item)
+                        return
 
-                    return
-
-        #print "[httpMessage] before setComment" 
-        messageInfo.setComment(SCOPE_MONITOR_COMMENT)
-        # reached here, must be new entry
-        analyzed = False
-        if self._callbacks.getToolName(toolFlag) == "Repeater":
-            if self.repeaterOptionButton.isSelected():
+            #print "[httpMessage] before setComment" 
+            messageInfo.setComment(SCOPE_MONITOR_COMMENT)
+            # reached here, must be new entry
+            analyzed = False
+            if self._callbacks.getToolName(toolFlag) == "Repeater":
+                if self.repeaterOptionButton.isSelected():
+                    analyzed = True
+                    #print "[httpMessage] setting analyzed as true" 
+            if self.GLOBAL_HANDLER_ANALYZED:
                 analyzed = True
-                #print "[httpMessage] setting analyzed as true" 
-        if self.GLOBAL_HANDLER_ANALYZED:
-            analyzed = True
 
-        #print "[httpMessage] after comment" 
-        #print 'in httpmessage, response:'
-        #print self._helpers.analyzeResponse(messageInfo.getResponse())
+            #print "[httpMessage] after comment" 
+            #print 'in httpmessage, response:'
+            #print self._helpers.analyzeResponse(messageInfo.getResponse())
 
-        date = datetime.datetime.fromtimestamp(time.time()).strftime('%H:%M:%S %d %b %Y')
-        entry = LogEntry(toolFlag, self._callbacks.saveBuffersToTempFiles(messageInfo), url, analyzed, date, method)
-        #print "toolFlag: " + str(toolFlag)
+            date = datetime.datetime.fromtimestamp(time.time()).strftime('%H:%M:%S %d %b %Y')
+            entry = LogEntry(toolFlag, self._callbacks.saveBuffersToTempFiles(messageInfo), url, analyzed, date, method)
+            #print "toolFlag: " + str(toolFlag)
 
-        #print "(processHTTP) Adding URL: " + url 
-        self._log.add(entry)
-        self._fullLog.add(entry)
-        self.fireTableRowsInserted(row, row)
+            #print "(processHTTP) Adding URL: " + url 
+            self._log.add(entry)
+            self._fullLog.add(entry)
+            self.fireTableRowsInserted(row, row)
 
-        self.paintItems(messageInfo, entry)
+            self.paintItems(messageInfo, entry)
+        except Exception as e:
+            print e.message
+            self._lock.release()
 
         self._lock.release()
 
@@ -758,18 +893,20 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IMessageEditorController,
     #
     
     def paintItems(self, messageInfo, item):
-        '''
-        print "in paint Items"
-        print "mark color is: (true)" + str(self.markTestedRequestsProxy.isSelected())
-        print "global handler analyzed:           :" + str(self.GLOBAL_HANDLER_ANALYZED)
-        print "item analyzed should be the same ^^:" + str(item._analyzed)
-        '''
+        print "arrive 897: in paint Items"
+        # print "mark color is: (true)" + str(self.markTestedRequestsProxy.isSelected())
+        # print "global handler analyzed:           :" + str(self.GLOBAL_HANDLER_ANALYZED)
+        # print "item analyzed should be the same ^^:" + str(item._analyzed)
+        # print "--------893:"+str(self.GLOBAL_HANDLER_ANALYZED)+"---------------"
         if (self.markTestedRequestsProxy.isSelected()) and (item._analyzed and self.GLOBAL_HANDLER_ANALYZED):
             messageInfo.setHighlight("green")
+            # print "---------897:into paint green--------------"
             return
-
         if self.markNotTestedRequestsProxy.isSelected() and not(item._analyzed):
             messageInfo.setHighlight("red")
+            # print "---------897:into red green--------------"
+            # return
+        # print "--------------903:into exception---------"
 
 
     def getRowCount(self):
@@ -919,7 +1056,8 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IMessageEditorController,
                     if SCOPE_MONITOR_COMMENT in item.getComment():
                         proxyItems.append(item)
 
-            #print 'proxyItems has: ' + str(len(proxyItems))
+
+            print 'proxyItems has: ' + str(len(proxyItems))
             # TODO - if no proxy items, sraight to import
 
             lines = f.read().splitlines()
@@ -929,11 +1067,17 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IMessageEditorController,
                 url = self._helpers.urlDecode(url) 
 
                 #print 'Saving: ' + url
+                if not self._callbacks.isInScope(URL(url)):
+                    print '-- imported url not in scope, skipping.. '
+                    continue
+
 
                 analyzed = False
                 if data[0] == "True":
                     analyzed = True
 
+
+                #print '.. simulating url search.. '
                 requestResponse = None
                 for request in proxyItems:
                     if url == self.getEndpoint(request):
@@ -943,7 +1087,6 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IMessageEditorController,
 
                 self._log.add(LogEntry("", requestResponse, url, analyzed, data[3], data[2]) ) 
 
-                #(self, tool, requestResponse, url, analyzed, date, method):
 
             self._lockFile.release()
         print 'finished loading.. '
@@ -1138,25 +1281,41 @@ class markRequestsHandler(ActionListener):
     def actionPerformed(self, e):
         #print "COPY SELECTED URL HANDLER ******"
         #print "Status is: " + str(self._state)
+        # print "into markrequestedshandler"
 
         rows = self._extender.logTable.getSelectedRows()
-        for row in rows:
+        try:
+            for row in rows:
+                # print "into for"
 
-            model_row = self._extender.logTable.convertRowIndexToModel(row)
-            url = self._extender._log.get(model_row)._url
+                model_row = self._extender.logTable.convertRowIndexToModel(row)
+                url = self._extender._log.get(model_row)._url
+                method =self._extender._log.get(model_row)._method
 
-            #print "Changing url: " + url
+                #print "Changing url: " + url
 
-            ### TODO REPLACE FOR MARK_AS_ANALYZED 
-            self._extender._lock.acquire()
+                ### TODO REPLACE FOR MARK_AS_ANALYZED 
+                self._extender._lock.acquire()
 
-            for item in self._extender._log:
-                if url == item._url:
-                    item._analyzed = self._state
-                    self._extender.paintItems(item._requestResponse, item)
-                    #break
+                # print "arrive 1302"
+                for item in self._extender._log:
+                    if url == item._url and method==item._method:
+                        # print "arrive 1305"
+                        item._analyzed = self._state
+                        # print "arrive 1307: panintitems with",item._analyzed
+                        # 修改即可无须重画会造成死锁,set value的时候会和ColoredTableCellRenderer的触发监听函数造成冲突
+                        # self._extender.paintItems(item._requestResponse, item)
+                        break
+                # 同步修改对应的log 和 fulllog数据
+                for item in self._extender._fullLog:
+                    if url == item._url and method==item._method:
+                        # print "arrive 1313"
+                        item._analyzed = self._state
+                # print "arrive 1315"
+                self._extender._lock.release()
+        except Exception as e:
+            print e.message
             self._extender._lock.release()
-
 
         self._extender.fireTableDataChanged()
         #print 'refreshing view ..... *****'
@@ -1180,15 +1339,29 @@ class handleMenuItems(ActionListener):
 
         if self._menuName == "analyzed":
             self._extender.GLOBAL_HANDLER_ANALYZED = True
-            self._extender.processHttpMessage(4, self._messageInfo, self._messageInfo)
+            self._extender.processHttpMessageAdvanced(4, self._messageInfo, self._messageInfo)
             self._extender.markAnalyzed(self._messageInfo, True)
             #start_new_thread(self._extender.sendRequestToAutorizeWork,(self._messageInfo,))
 
         if self._menuName == "not":
             self._extender.GLOBAL_HANDLER_ANALYZED = False
-            self._extender.processHttpMessage(4, self._messageInfo, self._messageInfo)
+            self._extender.processHttpMessageAdvanced(4, self._messageInfo, self._messageInfo)
             self._extender.markAnalyzed(self._messageInfo, False)
 
         self._extender.GLOBAL_HANDLER_ANALYZED = False
         self._extender.GLOBAL_HANDLER = False
             #self._extender.replaceString.setText(self._extender.getCookieFromMessage(self._messageInfo))
+
+class passiveScanner(IScannerCheck):
+    def __init__(self, extender):
+        self._extender = extender
+
+    def doPassiveScan(self, messageInfo):
+        pass
+        # print "--> passiveScan:"
+        #print messageInfo
+        # 4 = "Proxy"
+        # self._extender.processHttpMessageAdvanced(1234, messageInfo, messageInfo)
+
+if __name__ in ('__main__', 'main'):
+    EventQueue.invokeLater(Run(BurpExtender))
